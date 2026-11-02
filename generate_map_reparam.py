@@ -87,8 +87,17 @@ def extract_map_reparam(
     return lambda_raw, Z_P, Z_Q
 
 
-def _stack_reparam(maps: list) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Extract and stack (lambda_raw, Z_P, Z_Q) for a list of MAP objects."""
+def _stack_reparam(maps: list, n: int | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract and stack (lambda_raw, Z_P, Z_Q) for a list of MAP objects.
+
+    If n is given, every map must have exactly n phases (a generator returning another size,
+    e.g. the random_map helper's retry at a random size, is reported here instead of failing
+    later as a shape mismatch in the fitter).
+    """
+    if n is not None:
+        for m in maps:
+            if m.D0.shape[0] != n:
+                raise ValueError(f"{m.process_type}: sampler returned {m.D0.shape[0]} states, expected {n}")
     parts = [extract_map_reparam(m.D0, m.D1) for m in maps]
     return (
         np.stack([p[0] for p in parts]),
@@ -130,7 +139,7 @@ def sample_alternating_blocks_reparam_tensors(
         )
         for _ in range(num_maps)
     ]
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -146,7 +155,7 @@ def sample_alternating_extreme_reparam_tensors(
         sm.generate_alternating_extreme_map(na, nb, seed=int(rng.integers(0, 2**31)))
         for _ in range(num_maps)
     ]
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -162,7 +171,7 @@ def sample_alternating_extreme_hyper_reparam_tensors(
         sm.generate_alternating_extreme_hyper_map(na, nb, seed=int(rng.integers(0, 2**31)))
         for _ in range(num_maps)
     ]
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -181,7 +190,7 @@ def sample_diverse_ph_reparam_tensors(
         )
         for i in range(num_maps)
     ]
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -201,7 +210,7 @@ def sample_modified_renewal_ph_reparam_tensors(
         )
         for i in range(num_maps)
     ]
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -216,7 +225,7 @@ def sample_random_map_reparam_tensors(
         sm.generate_random_map_method_map(n, seed=int(rng.integers(0, 2**31)))
         for _ in range(num_maps)
     ]
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -231,7 +240,7 @@ def sample_random_map_negative1_reparam_tensors(
         sm.generate_random_map_negative1_method_map(n, seed=int(rng.integers(0, 2**31)))
         for _ in range(num_maps)
     ]
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -246,7 +255,7 @@ def sample_erlang_renewal_reparam_tensors(
         sm.generate_erlang_renewal_map(n, seed=int(rng.integers(0, 2**31)))
         for _ in range(num_maps)
     ]
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -261,7 +270,7 @@ def sample_sparse_ph_renewal_reparam_tensors(
         sm.generate_sparse_ph_renewal_map(n, seed=int(rng.integers(0, 2**31)))
         for _ in range(num_maps)
     ]
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -276,7 +285,7 @@ def sample_hyper_erlang_renewal_reparam_tensors(
         sm.generate_hyper_erlang_renewal_map(n, seed=int(rng.integers(0, 2**31)))
         for _ in range(num_maps)
     ]
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -291,7 +300,7 @@ def sample_modified_hyper_erlang_renewal_reparam_tensors(
         sm.generate_modified_hyper_erlang_renewal_map(n, seed=int(rng.integers(0, 2**31)))
         for _ in range(num_maps)
     ]
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -312,28 +321,59 @@ def sample_slow_switching_mmpp_reparam_tensors(
                 seed=int(rng.integers(0, 2**31)),
             )
         )
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
 # 14. erlang_modulated  (k=2 modes, m=n//2 phases each → total n)
 # ------------------------------------------------------------------
 
+def modulated_chains(
+    rng: np.random.Generator, lengths: np.ndarray, mode_means: np.ndarray, concentration: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Erlang chains of the given lengths (they may differ, so any total n is possible).
+
+    Chain i has mean mode_means[i]; an arrival at its last phase restarts chain j with
+    Dirichlet probabilities concentrated (weight `concentration`) on j = i.  Same construction
+    as sm.generate_erlang_modulated_map / generate_erlang_rate_spread_map, which only allow
+    equal lengths (total k * m).
+    """
+    k, n = len(lengths), int(np.sum(lengths))
+    starts = np.concatenate([[0], np.cumsum(lengths)[:-1]]).astype(int)
+    D0, D1 = np.zeros((n, n)), np.zeros((n, n))
+    for mode in range(k):
+        s, m = starts[mode], int(lengths[mode])
+        rate = m / mode_means[mode]
+        for ph in range(m):
+            D0[s + ph, s + ph] = -rate
+            if ph < m - 1:
+                D0[s + ph, s + ph + 1] = rate
+        conc = np.ones(k)
+        conc[mode] = concentration
+        D1[s + m - 1, starts] = rate * rng.dirichlet(conc)
+    return D0, D1
+
+
+def _two_chain_lengths(n: int) -> np.ndarray:
+    """Two chains with n // 2 and n - n // 2 phases (total exactly n; n = 1 gives one chain)."""
+    return np.array([n // 2, n - n // 2]) if n >= 2 else np.array([1])
+
+
 def sample_erlang_modulated_reparam_tensors(
     num_maps: int, n: int, seed: int | None = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # Same distribution as sm.generate_erlang_modulated_map(2, n // 2, conc): mode rate
+    # ~ logU(0.2, 5) per phase-normalised chain, i.e. chain mean = 1 / rate draw. Built
+    # directly so that odd n gives chains of n // 2 and n // 2 + 1 phases (total n, not n - 1).
     rng = np.random.default_rng(seed)
-    k_modes, m_phases = 2, max(1, n // 2)
+    lengths = _two_chain_lengths(n)
     maps = []
     for _ in range(num_maps):
         conc = float(np.exp(rng.uniform(np.log(1.5), np.log(30.0))))
-        maps.append(
-            sm.generate_erlang_modulated_map(
-                k_modes, m_phases, same_mode_concentration=conc,
-                seed=int(rng.integers(0, 2**31)),
-            )
-        )
-    return _stack_reparam(maps)
+        means = 1.0 / np.exp(rng.uniform(np.log(0.2), np.log(5.0), size=len(lengths)))
+        D0, D1 = modulated_chains(rng, lengths, means, conc)
+        maps.append(sm.scale_map_to_mean(D0, D1, 1.0, "erlang_modulated", "erlang_modulated"))
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -357,7 +397,7 @@ def sample_hyper_telegraph_reparam_tensors(
                 seed=int(rng.integers(0, 2**31)),
             )
         )
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -378,7 +418,7 @@ def sample_erlang_telegraph_reparam_tensors(
                 seed=int(rng.integers(0, 2**31)),
             )
         )
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -388,20 +428,23 @@ def sample_erlang_telegraph_reparam_tensors(
 def sample_erlang_rate_spread_reparam_tensors(
     num_maps: int, n: int, seed: int | None = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # Same distribution as sm.generate_erlang_rate_spread_map(2, n // 2, rs, conc): one rare
+    # slow mode at fast_base / rate_spread, the other at fast_base * e^U(-0.5, 0.5). Built
+    # directly so that odd n gives chains of n // 2 and n // 2 + 1 phases (total n, not n - 1).
     rng = np.random.default_rng(seed)
-    k_modes, m_phases = 2, max(1, n // 2)
+    lengths = _two_chain_lengths(n)
+    k = len(lengths)
     maps = []
     for _ in range(num_maps):
         rs = float(np.exp(rng.uniform(np.log(50.0), np.log(5000.0))))
         conc = float(np.exp(rng.uniform(np.log(5.0), np.log(100.0))))
-        maps.append(
-            sm.generate_erlang_rate_spread_map(
-                k_modes, m_phases, rate_spread=rs,
-                same_mode_concentration=conc,
-                seed=int(rng.integers(0, 2**31)),
-            )
-        )
-    return _stack_reparam(maps)
+        slow = int(rng.integers(0, k))
+        fast_base = float(np.exp(rng.uniform(np.log(1.0), np.log(5.0))))
+        rates = np.array([fast_base / rs if i == slow else fast_base * float(np.exp(rng.uniform(-0.5, 0.5)))
+                          for i in range(k)])
+        D0, D1 = modulated_chains(rng, lengths, 1.0 / rates, conc)
+        maps.append(sm.scale_map_to_mean(D0, D1, 1.0, "erlang_rate_spread", "erlang_rate_spread"))
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -423,7 +466,7 @@ def sample_coxian_alternating_reparam_tensors(
                 seed=int(rng.integers(0, 2**31)),
             )
         )
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # ------------------------------------------------------------------
@@ -446,7 +489,7 @@ def sample_erlang_hyper_telegraph_reparam_tensors(
                 seed=int(rng.integers(0, 2**31)),
             )
         )
-    return _stack_reparam(maps)
+    return _stack_reparam(maps, n)
 
 
 # =============================================================================

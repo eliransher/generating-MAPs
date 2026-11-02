@@ -233,7 +233,31 @@ def sample_mmpp_reparam_tensors(
     Z_Q = np.zeros((num_maps, n, n))
     Z_Q[:, idx, idx] = SOFTMAX_LARGE            # M=500 >> 0 -> softmax gives row ≈ e_i
 
+    # --- scale every map to mean inter-arrival 1, like sm.scale_map_to_mean does for the
+    # other generators: multiplying all rates by m1 divides the mean by m1, and
+    # rates = lambda_raw^2, so lambda_raw *= sqrt(m1). Shape statistics are unchanged.
+    for k in range(num_maps):
+        lambda_raw[k] *= np.sqrt(_mean_interarrival(lambda_raw[k], Z_P[k]))
+
     return lambda_raw, Z_P, Z_Q
+
+
+def _mean_interarrival(lambda_raw: np.ndarray, Z_P: np.ndarray) -> float:
+    """Stationary mean inter-arrival time of the MMPP encoded by (lambda_raw, Z_P) with Q = I."""
+    n = len(lambda_raw)
+    rates = lambda_raw ** 2
+    P = _softmax_rows(Z_P)
+    D0 = rates[:, None] * P
+    np.fill_diagonal(D0, -rates)
+    D1 = np.diag(rates * np.diag(P))
+    A = (D0 + D1).T.copy()
+    A[-1, :] = 1.0
+    b = np.zeros(n)
+    b[-1] = 1.0
+    pi = np.linalg.solve(A, b)                  # stationary distribution of D0 + D1
+    beta = pi @ D1
+    beta = beta / beta.sum()                    # phase distribution at arrival epochs
+    return float(beta @ np.linalg.solve(-D0, np.ones(n)))
 
 
 # =============================================================================
